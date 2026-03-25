@@ -1,0 +1,183 @@
+###############################################################
+# Title: Visualization of Clinical Bottlenecks in MDM2 Inhibitor Trials
+# Author: Smeeta Shrestha
+# Date: 25 March 2026
+# Description:
+# This script generates a two-panel figure:
+# (A) Heatmap showing presence/absence of bottlenecks (PK, PD, Toxicity)
+# (B) Bar plot summarizing frequency of bottlenecks across trials
+#
+# Dependencies: tidyverse, patchwork, stringr
+# Output: Publication-quality composite figure
+###############################################################
+
+##############################
+# 1. Load Required Libraries
+##############################
+library(tidyverse)   # Data manipulation + ggplot2
+library(patchwork)   # Combine plots
+library(stringr)     # String formatting
+
+##############################
+# 2. Input Data
+##############################
+# Binary encoding:
+# 1 = bottleneck present
+# 0 = bottleneck absent
+
+trial_data <- tribble(
+  ~Trial, ~PK, ~PD, ~Toxicity,
+  "RG7112", 1, 0, 1,
+  "Idasanutlin (MIRROS)", 0, 1, 1,
+  "RO6839921", 0, 0, 1,
+  "Navtemadlin (AMG232)", 0, 0, 1,
+  "Milademetan", 0, 1, 1,
+  "Venetoclax + Idasanutlin", 0, 1, 0
+)
+
+##############################
+# 3. Data Transformation
+##############################
+# Convert wide → long format for ggplot compatibility
+
+heatmap_data <- trial_data %>%
+  pivot_longer(
+    cols = PK:Toxicity,
+    names_to = "Category",
+    values_to = "Presence"
+  )
+
+##############################
+# 4. Define Color Scheme
+##############################
+# Colorblind-friendly palette
+
+category_colors <- c(
+  "PK" = "#D73027",        # Red
+  "PD" = "#1A9850",        # Green
+  "Toxicity" = "#4575B4"   # Blue
+)
+
+##############################
+# 5. Titles (Wrapped for Publication)
+##############################
+
+titleA <- str_wrap(
+  "A. Clinical Bottlenecks Across Trials of MDM2 Inhibitors in Acute Myeloid Leukemia",
+  width = 50
+)
+
+titleB <- str_wrap(
+  "B. Frequency of Pharmacokinetic, Pharmacodynamic, and Toxicity Bottlenecks",
+  width = 50
+)
+
+##############################
+# 6. Panel A: Heatmap
+##############################
+
+panelA <- ggplot(heatmap_data, aes(x = Category, y = Trial)) +
+  
+  # Base grid
+  geom_tile(fill = "white", color = "grey80") +
+  
+  # Overlay points where bottleneck exists
+  geom_point(
+    data = subset(heatmap_data, Presence == 1),
+    aes(color = Category),
+    size = 6
+  ) +
+  
+  scale_color_manual(values = category_colors) +
+  
+  labs(
+    title = titleA,
+    x = "Evaluation Domain",
+    y = "Clinical Trial"
+  ) +
+  
+  theme_classic(base_size = 16) +
+  theme(
+    axis.text = element_text(face = "bold"),
+    legend.position = "none",
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 14)
+  )
+
+##############################
+# 7. Panel B: Frequency Bar Plot
+##############################
+
+# Ensure all categories appear (even if zero)
+freq_data <- heatmap_data %>%
+  group_by(Category) %>%
+  summarise(
+    Bottleneck_Count = sum(Presence),
+    .groups = "drop"
+  ) %>%
+  complete(
+    Category = c("PK", "PD", "Toxicity"),
+    fill = list(Bottleneck_Count = 0)
+  )
+
+panelB <- ggplot(
+  freq_data,
+  aes(
+    x = Category,
+    y = Bottleneck_Count,
+    fill = Category
+  )
+) +
+  
+  geom_bar(stat = "identity", width = 0.6) +
+  
+  scale_fill_manual(values = category_colors) +
+  
+  labs(
+    title = titleB,
+    x = "Bottleneck Category",
+    y = "Number of Trials"
+  ) +
+  
+  theme_classic(base_size = 16) +
+  theme(
+    axis.text = element_text(face = "bold"),
+    axis.title.y = element_text(
+      face = "bold",
+      margin = margin(r = 10)
+    ),
+    legend.position = "none",
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 14)
+  )
+
+##############################
+# 8. Combine Panels
+##############################
+
+final_plot <- panelA / panelB +
+  plot_layout(heights = c(2, 1.5))
+
+##############################
+# 9. Save Output (Recommended)
+##############################
+
+# Save as high-resolution figure for publication
+ggsave(
+  filename = "MDM2_bottleneck_analysis.png",
+  plot = final_plot,
+  width = 10,
+  height = 12,
+  dpi = 300
+)
+
+##############################
+# 10. Optional: Export Data
+##############################
+
+# Save processed datasets for reproducibility
+write_csv(trial_data, "trial_data.csv")
+write_csv(heatmap_data, "heatmap_data_long.csv")
+write_csv(freq_data, "bottleneck_frequency.csv")
+
+###############################################################
+# End of Script
+###############################################################
