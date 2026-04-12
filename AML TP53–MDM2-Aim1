@@ -1,0 +1,213 @@
+############################################################
+# AML TP53–MDM2 Dependency & Transcriptomic Analysis
+# Date: 01 April 2026
+# Integrated analysis of CRISPR dependency, gene expression,
+# differential expression, visualization, and KEGG enrichment
+############################################################
+
+# ----------------------------
+# 0. Load required packages
+# ----------------------------
+required_cran <- c("tidyverse","data.table","stringr","ggrepel","pheatmap")
+required_bioc <- c("clusterProfiler","org.Hs.eg.db","enrichplot","AnnotationDbi")
+
+# Install/load CRAN packages
+for(pkg in required_cran){
+  if(!require(pkg, character.only = TRUE)){
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+}
+
+# Install/load Bioconductor packages
+if(!requireNamespace("BiocManager", quietly = TRUE)){
+  install.packages("BiocManager")
+}
+for(pkg in required_bioc){
+  if(!require(pkg, character.only = TRUE)){
+    BiocManager::install(pkg)
+    library(pkg, character.only = TRUE)
+  }
+}
+
+# ----------------------------
+# 1. Load data
+# ----------------------------
+setwd("/Users/smeetashrestha/Desktop/aidan")
+
+crispr     <- fread("CRISPRGeneEffect.csv")
+model      <- fread("Model.csv")
+expression <- fread("OmicsExpressionTPMLogp1HumanProteinCodingGenes.csv")
+mutations  <- fread("OmicsSomaticMutations.csv")
+
+# ----------------------------
+# 2. Filter AML cell lines
+# ----------------------------
+aml_lines <- model[OncotreePrimaryDisease == "Acute Myeloid Leukemia",
+                   .(ModelID, StrippedCellLineName)]
+
+setnames(crispr, "V1", "DepMap_ID")
+crispr_aml <- crispr[DepMap_ID %in% aml_lines$ModelID]
+
+# ----------------------------
+# 3. TP53 mutation status
+# ----------------------------
+tp53_status <- unique(mutations[HugoSymbol == "TP53", .(ModelID)])
+tp53_status[, TP53_status := "Mutant"]
+
+aml_tp53 <- merge(aml_lines, tp53_status, by = "ModelID", all.x = TRUE)
+aml_tp53[, TP53_status := fifelse(is.na(TP53_status), "WildType", TP53_status)]
+
+# ----------------------------
+# 4. MDM2 dependency extraction
+# ----------------------------
+mdm2_col <- grep("^MDM2", names(crispr_aml), value = TRUE)
+mdm2_dep <- crispr_aml[, .(DepMap_ID, MDM2 = get(mdm2_col))]
+
+mdm2_analysis <- merge(mdm2_dep, aml_tp53,
+                       by.x = "DepMap_ID", by.y = "ModelID",
+                       all.x = TRUE)
+
+# ----------------------------
+# 5. Expression matrix preparation
+# ----------------------------
+expression[, ModelID := str_trim(as.character(ModelID))]
+aml_lines[, ModelID := str_trim(as.character(ModelID))]
+
+expression_aml <- expression[ModelID %in% aml_lines$ModelID]
+
+aml_expr_tp53 <- merge(expression_aml,
+                       aml_tp53[, .(ModelID, TP53_status)],
+                       by = "ModelID", all.x = TRUE)
+
+# Identify gene columns
+metadata_cols <- c("ModelID","TP53_status","V1","SequencingID",
+                   "IsDefaultEntryForModel","ModelConditionID","IsDefaultEntryForMC")
+
+gene_cols <- setdiff(colnames(aml_expr_tp53), metadata_cols)
+
+# Convert to numeric
+aml_expr_tp53[, (gene_cols) := lapply(.SD, as.numeric), .SDcols = gene_cols]
+
+# Create matrix
+aml_matrix <- aml_expr_tp53[, c("ModelID", gene_cols, "TP53_status"), with = FALSE]
+
+# Set rownames
+aml_matrix_df <- as.data.frame(aml_matrix)
+rownames(aml_matrix_df) <- aml_matrix_df$ModelID
+aml_matrix_df$ModelID <- NULL
+
+# ----------------------------
+# 6. Differential expression
+# ----------------------------
+gene_cols <- setdiff(colnames(aml_matrix_df), "TP53_status")
+
+de_results <- data.table(Gene = gene_cols,
+                         p_value = NA_real_,
+                         WT_mean = NA_real_,
+                         Mut_mean = NA_real_)
+
+for(g in gene_cols){
+  wt_vals  <- aml_matrix_df[aml_matrix_df$TP53_status == "WildType", g]
+  mut_vals <- aml_matrix_df[aml_matrix_df$TP53_status == "Mutant", g]
+
+  if(sum(!is.na(wt_vals)) < 2 | sum(!is.na(mut_vals)) < 2) next
+
+  test <- wilcox.test(wt_vals, mut_vals)
+
+  de_results[Gene == g, `:=`(
+    p_value = test$p.value,
+    WT_mean = mean(wt_vals, na.rm = TRUE),
+    Mut_mean = mean(mut_vals, na.rm = TRUE)
+  )]
+}
+
+# Add fold change + significance
+de_results[, log2FC := log2((Mut_mean + 1e-6)/(WT_mean + 1e-6))]
+de_results[, adj_p := p.adjust(p_value, method = "fdr")]
+de_results[, sig := ifelse(adj_p < 0.05, "Significant", "Not Significant")]
+
+# ----------------------------
+# 7. Heatmap
+# ----------------------------
+top_genes <- de_results[sig == "Significant"][order(adj_p)][1:30, Gene]
+top_genes <- top_genes[top_genes %in% colnames(aml_matrix_df)]
+
+if(length(top_genes) == 0){
+  stop("No significant genes found for heatmap.")
+}
+
+heatmap_data <- aml_matrix_df[, top_genes]
+heatmap_scaled <- t(scale(t(as.matrix(heatmap_data))))
+
+annotation_row <- data.frame(TP53 = aml_matrix_df$TP53_status)
+rownames(annotation_row) <- rownames(aml_matrix_df)
+
+pheatmap(heatmap_scaled,
+         annotation_row = annotation_row,
+         show_rownames = TRUE,
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         main = "Top TP53 Differentially Expressed Genes (AML)",
+         color = colorRampPalette(c("blue","white","red"))(100))
+
+# ----------------------------
+# 8. Volcano plot
+# ----------------------------
+de_results[, color_plot := ifelse(sig == "Significant" & log2FC > 1, "Upregulated",
+                           ifelse(sig == "Significant" & log2FC < -1, "Downregulated",
+                                  "Not Significant"))]
+
+ggplot(de_results, aes(x = log2FC, y = -log10(adj_p), color = color_plot)) +
+  geom_point(alpha = 0.7, size = 2) +
+  scale_color_manual(values = c("Upregulated" = "red",
+                                "Downregulated" = "blue",
+                                "Not Significant" = "grey")) +
+  geom_vline(xintercept = c(-1,1), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  geom_text_repel(data = de_results[sig == "Significant"][1:20],
+                  aes(label = Gene),
+                  size = 3) +
+  theme_minimal() +
+  labs(title = "TP53-dependent Differential Expression (AML)",
+       x = "Log2 Fold Change (Mut / WT)",
+       y = "-log10(FDR)")
+
+# ----------------------------
+# 9. KEGG enrichment
+# ----------------------------
+gene_symbols <- unique(top_genes)
+gene_symbols <- gene_symbols[!is.na(gene_symbols)]
+
+# Clean symbols
+gene_symbols <- toupper(gsub("\\s*\\(.*\\)$", "", gene_symbols))
+
+# Map to ENTREZ
+gene_df <- bitr(gene_symbols,
+                fromType = "SYMBOL",
+                toType = "ENTREZID",
+                OrgDb = org.Hs.eg.db)
+
+if(nrow(gene_df) == 0){
+  stop("No ENTREZ IDs mapped.")
+}
+
+# KEGG enrichment
+kegg_res <- enrichKEGG(gene = gene_df$ENTREZID,
+                       organism = "hsa",
+                       pvalueCutoff = 0.05)
+
+if(nrow(kegg_res) > 0){
+  dotplot(kegg_res, showCategory = 20) +
+    ggtitle("KEGG Pathway Enrichment (TP53-dependent AML)")
+}
+
+# Network plot
+if(nrow(kegg_res) > 0){
+  cnetplot(kegg_res, showCategory = 10) +
+    ggtitle("KEGG Gene-Pathway Network")
+}
+
+# ----------------------------
+# End of script
+# ----------------------------
