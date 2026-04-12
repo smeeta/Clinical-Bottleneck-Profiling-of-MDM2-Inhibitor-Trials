@@ -1,0 +1,174 @@
+############################################################
+# AML MDM2 Drug Sensitivity Analysis (GDSC2)
+# Date: 28 March 2026
+# Description:
+# Integration of AML metadata with GDSC2 pharmacogenomic data
+# to evaluate MDM2 inhibitor sensitivity stratified by TP53 status
+############################################################
+
+# ----------------------------
+# 0. Load Required Libraries
+# ----------------------------
+required_pkgs <- c("data.table","ggplot2","ggpubr","pheatmap","reshape2","grid")
+
+for(pkg in required_pkgs){
+  if(!require(pkg, character.only = TRUE)){
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+}
+
+# ----------------------------
+# 1. Load Input Data
+# ----------------------------
+aml_meta <- fread("aml_meta.csv")   # Contains: cell_line, TP53_status
+gdsc <- fread("GDSC2_fitted_dose_response_27Oct23.csv")
+
+# Ensure consistent data types
+aml_meta[, cell_line := as.character(cell_line)]
+gdsc[, `:=`(
+  CELL_LINE_NAME = as.character(CELL_LINE_NAME),
+  CANCER_TYPE    = as.character(CANCER_TYPE),
+  DRUG_NAME      = as.character(DRUG_NAME),
+  PUTATIVE_TARGET= as.character(PUTATIVE_TARGET)
+)]
+
+# ----------------------------
+# 2. Filter AML Samples
+# ----------------------------
+gdsc_aml <- gdsc[grepl("acute myeloid leukemia", CANCER_TYPE, ignore.case = TRUE)]
+
+cat("Total AML entries in GDSC2:", nrow(gdsc_aml), "\n")
+
+# ----------------------------
+# 3. Identify MDM2-targeting Drugs
+# ----------------------------
+mdm2_drugs <- unique(
+  gdsc_aml[grepl("MDM2", PUTATIVE_TARGET, ignore.case = TRUE), DRUG_NAME]
+)
+
+cat("Identified MDM2-targeting drugs:", length(mdm2_drugs), "\n")
+
+# ----------------------------
+# 4. Subset Relevant Drug Response Data
+# ----------------------------
+aml_mdm2 <- gdsc_aml[DRUG_NAME %in% mdm2_drugs,
+                     .(CELL_LINE_NAME, DRUG_NAME, LN_IC50, AUC, Z_SCORE)]
+
+# ----------------------------
+# 5. Merge with AML Metadata
+# ----------------------------
+aml_merged <- merge(aml_meta, aml_mdm2,
+                    by.x = "cell_line",
+                    by.y = "CELL_LINE_NAME",
+                    all = FALSE)
+
+cat("Matched AML cell lines:", nrow(aml_merged), "\n")
+
+# Save merged dataset
+fwrite(aml_merged, "AML_GDSC2_MDM2_merged.csv")
+
+# ----------------------------
+# 6. Global Drug Sensitivity Visualization
+# ----------------------------
+p1 <- ggplot(aml_merged, aes(x = DRUG_NAME, y = LN_IC50)) +
+  geom_boxplot(fill = "lightblue", outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.6) +
+  theme_minimal(base_size = 14) +
+  labs(title = "MDM2 Inhibitor Sensitivity in AML",
+       x = "Drug",
+       y = "LN(IC50)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p1)
+
+# ----------------------------
+# 7. Heatmap of Drug Sensitivity
+# ----------------------------
+mat <- dcast(aml_merged, cell_line ~ DRUG_NAME, value.var = "LN_IC50")
+
+rownames_mat <- mat$cell_line
+mat <- as.matrix(mat[,-1])
+rownames(mat) <- rownames_mat
+
+pheatmap(mat,
+         color = colorRampPalette(c("blue","white","red"))(50),
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         main = "AML Drug Sensitivity (LN_IC50)\nBlue = Sensitive | Red = Resistant",
+         fontsize_row = 8,
+         fontsize_col = 8,
+         border_color = NA)
+
+grid.text("LN_IC50", x = 0.92, y = 0.75,
+          gp = gpar(fontsize = 12, fontface = "bold"))
+
+# ----------------------------
+# 8. TP53-stratified Analysis
+# ----------------------------
+if("TP53_status" %in% colnames(aml_merged)){
+  
+  aml_merged[, TP53_status := factor(TP53_status,
+                                     levels = c("WildType","Mutant"))]
+  
+  # Boxplot with statistical testing
+  p2 <- ggplot(aml_merged,
+               aes(x = TP53_status, y = LN_IC50, fill = TP53_status)) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_jitter(width = 0.2, alpha = 0.6) +
+    stat_compare_means(method = "wilcox.test", label = "p.format") +
+    facet_wrap(~DRUG_NAME) +
+    scale_fill_manual(values = c("WildType" = "blue",
+                                 "Mutant" = "red")) +
+    theme_minimal(base_size = 14) +
+    labs(title = "TP53-dependent Sensitivity to MDM2 Inhibitors",
+         x = "TP53 Status",
+         y = "LN(IC50)") +
+    theme(legend.position = "none",
+          strip.text = element_text(face = "bold"))
+  
+  print(p2)
+}
+
+# ----------------------------
+# 9. Statistical Summary
+# ----------------------------
+summary_stats <- aml_merged[, .(
+  mean_LN_IC50 = mean(LN_IC50, na.rm = TRUE),
+  sd_LN_IC50   = sd(LN_IC50, na.rm = TRUE),
+  n            = .N
+), by = .(DRUG_NAME, TP53_status)]
+
+print(summary_stats)
+
+# Per-drug Wilcoxon tests
+wilcox_results <- lapply(unique(aml_merged$DRUG_NAME), function(drug){
+  dt <- aml_merged[DRUG_NAME == drug]
+  
+  if(length(unique(dt$TP53_status)) < 2) return(NULL)
+  
+  test <- wilcox.test(LN_IC50 ~ TP53_status, data = dt)
+  
+  data.table(
+    DRUG_NAME = drug,
+    p_value   = test$p.value
+  )
+})
+
+wilcox_results <- rbindlist(wilcox_results)
+wilcox_results[, adj_p := p.adjust(p_value, method = "fdr")]
+
+print(wilcox_results)
+
+# ----------------------------
+# 10. Save Final Outputs
+# ----------------------------
+fwrite(aml_merged, "AML_MDM2_GDSC2_TP53_dataset.csv")
+fwrite(summary_stats, "AML_MDM2_summary_stats.csv")
+fwrite(wilcox_results, "AML_MDM2_wilcox_results.csv")
+
+cat("All outputs saved successfully.\n")
+
+# ----------------------------
+# End of Script
+# ----------------------------
